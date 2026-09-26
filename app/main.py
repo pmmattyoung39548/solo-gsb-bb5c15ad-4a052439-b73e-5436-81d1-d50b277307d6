@@ -11,6 +11,8 @@ from . import db, seed, service
 from .models import (
     BatchCheckinCreate,
     BatchCheckinOut,
+    CalibratedCreate,
+    CalibratedOut,
     CheckinCreate,
     CheckinOut,
     CorrectionPreview,
@@ -37,7 +39,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
         "任一失败整体回滚），并可预演更正（整体回滚）；"
@@ -45,6 +47,7 @@ app = FastAPI(
         "提供分段入选解释：按站点列出全部打卡及是否入选，"
         "与分段结果基于同一次数据库读取；"
         "支持中立时段试算：扣除暂停计时后的净成绩，纯试算不写库；"
+        "支持设备时钟校准试算：按校准窗偏移重选各站打卡并重算分段，纯试算不写库；"
         "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询。"
     ),
     lifespan=lifespan,
@@ -168,6 +171,17 @@ def post_splits_neutralized(
     runner_id: str, payload: NeutralizedCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> NeutralizedOut:
     return service.compute_neutralized_splits(conn, runner_id, payload)
+
+
+@app.post(
+    "/api/runners/{runner_id}/splits/calibrated",
+    response_model=CalibratedOut,
+    summary="设备时钟校准试算：按校准窗偏移重选各站打卡并重算分段（纯试算，不写库）",
+)
+def post_splits_calibrated(
+    runner_id: str, payload: CalibratedCreate, conn: sqlite3.Connection = Depends(get_db)
+) -> CalibratedOut:
+    return service.compute_calibrated_splits(conn, runner_id, payload)
 
 
 @app.post(

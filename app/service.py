@@ -14,6 +14,9 @@ from .models import (
     BatchCheckinOut,
     BatchItemOut,
     BatchRunnerResult,
+    CalibratedCreate,
+    CalibratedOut,
+    CalibratedStationTime,
     CheckinCreate,
     CheckinOut,
     CheckinSelection,
@@ -317,16 +320,15 @@ def _select_best(rows: list[sqlite3.Row]) -> dict[int, tuple[datetime, str]]:
     return best
 
 
-def _splits_from_best(
-    best: dict[int, tuple[datetime, str]], runner_id: str
-) -> SplitsOut:
-    """由"站点 -> 入选 (时间, 事件号)"按相邻站规则计算分段结果。"""
-    count = station_count()
-    stations = [
-        StationTime(station_seq=seq, event_no=ev, occurred_at=t)
-        for seq, (t, ev) in sorted(best.items())
-    ]
+def _segments_from_best(
+    best: dict[int, tuple[datetime, str]]
+) -> tuple[list[Segment], bool, int | None]:
+    """由"站点 -> 入选 (时间, 事件号)"按相邻站规则计算分段。
 
+    返回 (分段列表, 是否全部有效, 总秒数或 None)；相邻站缺打卡或时间倒退
+    的分段标记为 pending 并说明原因。实时分段与校准试算共用本规则。
+    """
+    count = station_count()
     segments: list[Segment] = []
     for k in range(1, count):
         a = best.get(k)
@@ -377,9 +379,21 @@ def _splits_from_best(
     total_seconds = (
         sum(s.duration_seconds for s in segments) if complete else None
     )
+    return segments, complete, total_seconds
+
+
+def _splits_from_best(
+    best: dict[int, tuple[datetime, str]], runner_id: str
+) -> SplitsOut:
+    """由"站点 -> 入选 (时间, 事件号)"按相邻站规则计算分段结果。"""
+    stations = [
+        StationTime(station_seq=seq, event_no=ev, occurred_at=t)
+        for seq, (t, ev) in sorted(best.items())
+    ]
+    segments, complete, total_seconds = _segments_from_best(best)
     return SplitsOut(
         runner_id=runner_id,
-        station_count=count,
+        station_count=station_count(),
         complete=complete,
         total_seconds=total_seconds,
         total=_fmt_duration(total_seconds) if total_seconds is not None else None,
@@ -632,6 +646,104 @@ def compute_neutralized_splits(
         deducted_seconds=deducted_total,
         net_seconds=net_total,
         net=_fmt_duration(net_total) if net_total is not None else None,
+    )
+
+
+# ---------- 设备时钟校准试算 ----------
+
+
+def compute_calibrated_splits(
+    conn: sqlite3.Connection, runner_id: str, payload: CalibratedCreate
+) -> CalibratedOut:
+    """设备时钟校准试算：按校准窗偏移重选各站打卡并重算分段。
+
+    - 校准窗时间统一转 UTC（无时区按 UTC 处理），区间左闭右开；
+      终点不晚于起点、站点越界或同站窗口重叠（相接允许）均拒绝（422）；
+    - 按原始打卡时间匹配本站的校准窗：校准时间 = 原始时间 + 偏移，
+      未命中任何窗口的打卡保持原值；
+    - 与实时分段同一次读取全部 active 打卡，按 (校准时间, 事件号)
+      升序重新选取每站最早记录，再复用相邻站分段规则，
+      缺站或（校准后）时间倒退的分段仍标记为 pending；
+    - 纯试算：不写入数据库，不影响实时成绩与已发布版本。
+    """
+    count = station_count()
+    windows_by_station: dict[int, list[tuple[datetime, datetime, int]]] = {}
+    for i, w in enumerate(payload.windows):
+        if w.station_seq > count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"第 {i} 个校准窗站点序号 {w.station_seq} 超出范围（1..{count}）",
+            )
+        start, end = _to_utc(w.start), _to_utc(w.end)
+        if end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail=f"第 {i} 个校准窗终点 {end.isoformat()} "
+                f"不晚于起点 {start.isoformat()}",
+            )
+        windows_by_station.setdefault(w.station_seq, []).append(
+            (start, end, w.offset_seconds)
+        )
+
+    # 同站窗口按起点排序后检查相邻对：左闭右开区间，后窗起点 < 前窗终点
+    # 即重叠；后窗起点 == 前窗终点为相接，允许
+    for station, wins in windows_by_station.items():
+        wins.sort()
+        for prev, cur in zip(wins, wins[1:]):
+            if cur[0] < prev[1]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"站点 {station} 的校准窗重叠："
+                    f"[{prev[0].isoformat()}, {prev[1].isoformat()}) 与 "
+                    f"[{cur[0].isoformat()}, {cur[1].isoformat()})",
+                )
+
+    any_row = conn.execute(
+        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
+    ).fetchone()
+    if any_row is None:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+
+    # 与实时分段同一次读取：仅有效打卡参与
+    rows = conn.execute(
+        "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
+        (runner_id, ACTIVE),
+    ).fetchall()
+
+    # 按原始时间匹配窗口得到校准时间，再按 (校准时间, 事件号) 选每站最早；
+    # 同站窗口互不重叠，一条打卡至多命中一个窗口
+    best: dict[int, tuple[datetime, str]] = {}
+    originals: dict[int, datetime] = {}
+    for r in rows:
+        original = datetime.fromisoformat(r["occurred_at"])
+        calibrated = original
+        for ws, we, offset in windows_by_station.get(r["station_seq"], ()):
+            if ws <= original < we:  # 左闭右开
+                calibrated = original + timedelta(seconds=offset)
+                break
+        key = (calibrated, r["event_no"])
+        cur = best.get(r["station_seq"])
+        if cur is None or key < cur:
+            best[r["station_seq"]] = key
+            originals[r["station_seq"]] = original
+
+    segments, complete, total_seconds = _segments_from_best(best)
+    return CalibratedOut(
+        runner_id=runner_id,
+        station_count=count,
+        complete=complete,
+        total_seconds=total_seconds,
+        total=_fmt_duration(total_seconds) if total_seconds is not None else None,
+        stations=[
+            CalibratedStationTime(
+                station_seq=seq,
+                event_no=ev,
+                occurred_at=originals[seq],
+                calibrated_at=t,
+            )
+            for seq, (t, ev) in sorted(best.items())
+        ],
+        segments=segments,
     )
 
 

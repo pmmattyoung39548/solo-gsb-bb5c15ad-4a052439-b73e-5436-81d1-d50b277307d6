@@ -223,6 +223,52 @@ class NeutralizedOut(BaseModel):
     net: Optional[str] = Field(default=None, description="净总用时，H:MM:SS")
 
 
+class CalibrationWindow(BaseModel):
+    """单条设备时钟校准窗：命中窗口的打卡按 offset_seconds 平移。"""
+
+    station_seq: int = Field(..., ge=1, description="站点序号（从 1 开始）")
+    start: datetime = Field(..., description="窗口起点，ISO 8601；无时区按 UTC 处理")
+    end: datetime = Field(..., description="窗口终点，ISO 8601；须晚于起点")
+    offset_seconds: int = Field(
+        ..., description="有符号整数偏移秒数：校准时间 = 原始时间 + 偏移"
+    )
+
+
+class CalibratedCreate(BaseModel):
+    """设备时钟校准试算请求：0~100 条校准窗，同站窗口不得重叠（相接允许）。"""
+
+    windows: list[CalibrationWindow] = Field(
+        ...,
+        max_length=100,
+        description="校准窗列表（0~100 条）；区间左闭右开，同站窗口不得重叠（相接允许）",
+    )
+
+
+class CalibratedStationTime(BaseModel):
+    """校准试算中某站入选事件的原始与校准时间。"""
+
+    station_seq: int
+    event_no: str
+    occurred_at: datetime = Field(..., description="原始打卡时间（UTC）")
+    calibrated_at: datetime = Field(
+        ..., description="校准时间 = 原始时间 + 命中窗口的偏移；未命中窗口时为原始时间"
+    )
+
+
+class CalibratedOut(BaseModel):
+    """设备时钟校准试算结果：纯试算不写库，基于请求时最新打卡计算。"""
+
+    runner_id: str
+    station_count: int
+    complete: bool = Field(..., description="所有分段均有效时为 true")
+    total_seconds: Optional[int] = Field(default=None, description="总用时（秒），仅 complete 时给出")
+    total: Optional[str] = Field(default=None, description="总用时，H:MM:SS")
+    stations: list[CalibratedStationTime] = Field(
+        ..., description="各站入选事件的原始与校准时间（按校准时间、事件号重新选取）"
+    )
+    segments: list[Segment]
+
+
 class PublicationOut(BaseModel):
     """一个已发布版本的完整成绩快照。"""
 
