@@ -14,6 +14,10 @@ from .models import (
     BatchCheckinOut,
     BatchItemOut,
     BatchRunnerResult,
+    CalibratedCreate,
+    CalibratedOut,
+    CalibratedStation,
+    CalibrationWindow,
     CheckinCreate,
     CheckinOut,
     CheckinSelection,
@@ -632,6 +636,125 @@ def compute_neutralized_splits(
         deducted_seconds=deducted_total,
         net_seconds=net_total,
         net=_fmt_duration(net_total) if net_total is not None else None,
+    )
+
+
+# ---------- 设备时钟校准试算 ----------
+
+
+def _validate_calibration_windows(
+    windows: list[CalibrationWindow],
+) -> dict[int, list[tuple[datetime, datetime, int]]]:
+    """校验并归一化校准窗，返回 站点序号 -> [(start, end, offset)]（按起点升序）。
+
+    时间统一转 UTC（无时区按 UTC 处理），区间左闭右开；终点不晚于起点、
+    站点越界、同站窗口重叠均返回 422，相接（前窗终点 == 后窗起点）允许。
+    """
+    count = station_count()
+    per_station: dict[int, list[tuple[datetime, datetime, int]]] = {}
+    for i, w in enumerate(windows):
+        if w.station_seq > count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"第 {i} 个校准窗站点序号 {w.station_seq} 超出范围（1..{count}）",
+            )
+        start, end = _to_utc(w.start), _to_utc(w.end)
+        if end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail=f"第 {i} 个校准窗终点 {end.isoformat()} "
+                f"不晚于起点 {start.isoformat()}",
+            )
+        per_station.setdefault(w.station_seq, []).append(
+            (start, end, w.offset_seconds)
+        )
+
+    for seq, wins in per_station.items():
+        wins.sort()
+        for (prev_start, prev_end, _), (start, end, _) in zip(wins, wins[1:]):
+            if start < prev_end:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"站点 {seq} 的校准窗重叠："
+                    f"[{prev_start.isoformat()}, {prev_end.isoformat()}) 与 "
+                    f"[{start.isoformat()}, {end.isoformat()})",
+                )
+    return per_station
+
+
+def _apply_calibration(
+    t: datetime, windows: list[tuple[datetime, datetime, int]]
+) -> datetime:
+    """按原始打卡时间匹配左闭右开校准窗；命中则叠加偏移，未命中保持原值。"""
+    for start, end, offset in windows:
+        if start <= t < end:
+            return t + timedelta(seconds=offset)
+    return t
+
+
+def compute_calibrated_splits(
+    conn: sqlite3.Connection, runner_id: str, payload: CalibratedCreate
+) -> CalibratedOut:
+    """设备时钟校准试算：评估按校准窗修正打卡时间后的成绩。
+
+    - 校准窗校验与归一化见 _validate_calibration_windows；
+    - 从同一次读取的全部 active 打卡出发，按原始打卡时间匹配本站校准窗，
+      校准时间 = 原始时间 + 偏移（未命中保持原值），再按 (校准时间, 事件号)
+      升序重新选取每站最早记录（与实时分段的平局规则一致）；
+    - 分段复用相邻站规则：缺站或校准后时间倒退的分段仍为 pending；
+    - 响应回显入选事件的原始与校准时间；空窗口时结果与实时分段一致；
+    - 纯试算：不写入数据库，不影响实时成绩与已发布版本。
+    """
+    per_station = _validate_calibration_windows(payload.windows)
+
+    any_row = conn.execute(
+        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
+    ).fetchone()
+    if any_row is None:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+
+    # 与实时分段同一次读取：仅统计 active 打卡
+    rows = conn.execute(
+        "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
+        (runner_id, ACTIVE),
+    ).fetchall()
+
+    original: dict[str, datetime] = {}
+    calibrated: dict[int, tuple[datetime, str]] = {}
+    for r in rows:
+        t = datetime.fromisoformat(r["occurred_at"])
+        original[r["event_no"]] = t
+        key = (_apply_calibration(t, per_station.get(r["station_seq"], [])), r["event_no"])
+        cur = calibrated.get(r["station_seq"])
+        if cur is None or key < cur:
+            calibrated[r["station_seq"]] = key
+
+    splits = _splits_from_best(calibrated, runner_id)
+    stations = [
+        CalibratedStation(
+            station_seq=seq,
+            event_no=ev,
+            occurred_at=original[ev],
+            calibrated_at=t,
+        )
+        for seq, (t, ev) in sorted(calibrated.items())
+    ]
+    windows = [
+        CalibrationWindow(
+            station_seq=seq, start=start, end=end, offset_seconds=offset
+        )
+        for seq, wins in sorted(per_station.items())
+        for start, end, offset in wins
+    ]
+    return CalibratedOut(
+        runner_id=runner_id,
+        station_count=splits.station_count,
+        complete=splits.complete,
+        windows=windows,
+        stations=stations,
+        segments=splits.segments,
+        total_seconds=splits.total_seconds,
+        total=splits.total,
     )
 
 
